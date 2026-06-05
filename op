@@ -159,7 +159,7 @@ cmd_projects_list() {
         status_c=$(printf "${C_DIM}%s${C_RESET}" "$status")
       fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$identifier" "$name" "$status_c" "$visibility"
-    done | column -t -s $'\t' -N "ID,IDENTIFIER,NAME,STATUS,VISIBILITY"
+    done | { printf 'ID\tIDENTIFIER\tNAME\tSTATUS\tVISIBILITY\n'; cat; } | column -t
 }
 
 cmd_projects_select() {
