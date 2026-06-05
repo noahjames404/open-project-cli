@@ -31,7 +31,7 @@ fi
 # Colorize a status string
 color_status() {
   local s="$1"
-  case "${s,,}" in
+  case "$(echo "$s" | tr '[:upper:]' '[:lower:]')" in
     new)              printf "${C_BRGREEN}%s${C_RESET}" "$s" ;;
     in*progress*)     printf "${C_BRYELLOW}%s${C_RESET}" "$s" ;;
     developed)        printf "${C_CYAN}%s${C_RESET}" "$s" ;;
@@ -46,7 +46,7 @@ color_status() {
 # Colorize a type string
 color_type() {
   local t="$1"
-  case "${t,,}" in
+  case "$(echo "$t" | tr '[:upper:]' '[:lower:]')" in
     bug)              printf "${C_BRRED}%s${C_RESET}" "$t" ;;
     task)             printf "${C_BRBLUE}%s${C_RESET}" "$t" ;;
     enhancement|feature) printf "${C_BRGREEN}%s${C_RESET}" "$t" ;;
