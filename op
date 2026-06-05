@@ -1,0 +1,979 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.4.0"
+
+# ─── Colors ────────────────────────────────────────────────────────────────────
+if [[ -t 1 || "${OP_COLOR:-}" == "1" || "${OP_COLOR:-}" == "always" ]]; then
+  C_RESET='\033[0m'
+  C_BOLD='\033[1m'
+  C_DIM='\033[2m'
+  C_RED='\033[31m'
+  C_GREEN='\033[32m'
+  C_YELLOW='\033[33m'
+  C_BLUE='\033[34m'
+  C_MAGENTA='\033[35m'
+  C_CYAN='\033[36m'
+  C_WHITE='\033[37m'
+  C_BRRED='\033[91m'
+  C_BRGREEN='\033[92m'
+  C_BRYELLOW='\033[93m'
+  C_BRBLUE='\033[94m'
+  C_BRMAGENTA='\033[95m'
+  C_BRCYAN='\033[96m'
+else
+  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW=''
+  C_BLUE='' C_MAGENTA='' C_CYAN='' C_WHITE='' C_BRRED=''
+  C_BRGREEN='' C_BRYELLOW='' C_BRBLUE='' C_BRMAGENTA=''
+  C_BRCYAN=''
+fi
+
+# Colorize a status string
+color_status() {
+  local s="$1"
+  case "${s,,}" in
+    new)              printf "${C_BRGREEN}%s${C_RESET}" "$s" ;;
+    in*progress*)     printf "${C_BRYELLOW}%s${C_RESET}" "$s" ;;
+    developed)        printf "${C_CYAN}%s${C_RESET}" "$s" ;;
+    resolved|fixed)   printf "${C_BRBLUE}%s${C_RESET}" "$s" ;;
+    closed|done)      printf "${C_DIM}%s${C_RESET}" "$s" ;;
+    rejected)         printf "${C_BRRED}%s${C_RESET}" "$s" ;;
+    on*hold|blocked)  printf "${C_RED}%s${C_RESET}" "$s" ;;
+    *)                printf "%s" "$s" ;;
+  esac
+}
+
+# Colorize a type string
+color_type() {
+  local t="$1"
+  case "${t,,}" in
+    bug)              printf "${C_BRRED}%s${C_RESET}" "$t" ;;
+    task)             printf "${C_BRBLUE}%s${C_RESET}" "$t" ;;
+    enhancement|feature) printf "${C_BRGREEN}%s${C_RESET}" "$t" ;;
+    milestone)        printf "${C_BRMAGENTA}%s${C_RESET}" "$t" ;;
+    *summary*)        printf "${C_BRYELLOW}%s${C_RESET}" "$t" ;;
+    *)                printf "%s" "$t" ;;
+  esac
+}
+
+# ─── Config ────────────────────────────────────────────────────────────────────
+CONFIG_FILE="${OPENPROJECT_CONFIG:-$HOME/.openprojectrc}"
+STATE_FILE="${OPENPROJECT_STATE:-$HOME/.op-state}"
+
+# Load or save the selected project
+get_selected_project() {
+  if [[ -f "$STATE_FILE" ]]; then
+    cat "$STATE_FILE"
+  fi
+}
+
+set_selected_project() {
+  local project_id="$1"
+  echo "$project_id" > "$STATE_FILE"
+}
+
+load_config() {
+  # Env vars take priority over config file
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+
+  OPENPROJECT_URL="${OPENPROJECT_URL:-}"
+  OPENPROJECT_API_KEY="${OPENPROJECT_API_KEY:-}"
+
+  if [[ -z "$OPENPROJECT_URL" || -z "$OPENPROJECT_API_KEY" ]]; then
+    echo "Error: OPENPROJECT_URL and OPENPROJECT_API_KEY must be set."
+    echo ""
+    echo "  Set them in $CONFIG_FILE:"
+    echo '    OPENPROJECT_URL="https://your-instance.openproject.com"'
+    echo '    OPENPROJECT_API_KEY="your-api-key"'
+    echo ""
+    echo "  Or export them as environment variables."
+    exit 1
+  fi
+
+  # Strip trailing slash from URL
+  OPENPROJECT_URL="${OPENPROJECT_URL%/}"
+}
+
+require_selected_project() {
+  local selected
+  selected=$(get_selected_project)
+  if [[ -z "$selected" ]]; then
+    echo "Error: No project selected. Use 'op projects select <id|identifier>' first." >&2
+    exit 1
+  fi
+  echo "$selected"
+}
+
+# ─── API helper ────────────────────────────────────────────────────────────────
+api_get() {
+  local endpoint="$1"
+  shift
+  curl -s -f \
+    -H "Content-Type: application/json" \
+    -u "apikey:${OPENPROJECT_API_KEY}" \
+    "${OPENPROJECT_URL}/api/v3${endpoint}" \
+    "$@"
+}
+
+# ─── Projects Commands ─────────────────────────────────────────────────────────
+
+cmd_projects_list() {
+  local filters='[]'
+  local sort_by='[["name","asc"]]'
+  local page_size=100
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --active)
+        filters='[{"active":{"operator":"=","values":["t"]}}]'
+        shift
+        ;;
+      --sort=*)
+        sort_by="[[\"${1#--sort=}\" | sed 's/:/\",\"/g')]]"
+        shift
+        ;;
+      *)
+        echo "Unknown option: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  local encoded_filters encoded_sort
+  encoded_filters=$(jq -sRr @uri <<< "$filters")
+  encoded_sort=$(jq -sRr @uri <<< "$sort_by")
+
+  local response
+  response=$(api_get "/projects?filters=${encoded_filters}&sortBy=${encoded_sort}&pageSize=${page_size}")
+
+  echo "$response" | jq -r '
+    ._embedded.elements[] |
+    "\(.id)\t\(.identifier)\t\(.name)\t\(if .active then "active" else "archived" end)\t\(if .public then "public" else "private" end)"
+  ' | while IFS=$'\t' read -r id identifier name status visibility; do
+      if [[ "$status" == "active" ]]; then
+        status_c=$(printf "${C_BRGREEN}%s${C_RESET}" "$status")
+      else
+        status_c=$(printf "${C_DIM}%s${C_RESET}" "$status")
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$identifier" "$name" "$status_c" "$visibility"
+    done | column -t -s $'\t' -N "ID,IDENTIFIER,NAME,STATUS,VISIBILITY"
+}
+
+cmd_projects_select() {
+  local selector="${1:-}"
+  if [[ -z "$selector" ]]; then
+    # Show current selection if no arg
+    local current
+    current=$(get_selected_project)
+    if [[ -n "$current" ]]; then
+      echo "Currently selected project ID: $current"
+    else
+      echo "No project selected. Use: op projects select <id|identifier>"
+    fi
+    return
+  fi
+
+  # If it's a pure number, use it directly as project ID
+  if [[ "$selector" =~ ^[0-9]+$ ]]; then
+    local response
+    response=$(api_get "/projects/$selector") || {
+      echo "Error: Project with ID $selector not found."
+      exit 1
+    }
+    local name identifier
+    name=$(echo "$response" | jq -r '.name')
+    identifier=$(echo "$response" | jq -r '.identifier')
+    set_selected_project "$selector"
+    echo "Selected project: $name ($identifier) [id=$selector]"
+    return
+  fi
+
+  # Otherwise, search by name or identifier
+  local encoded_filter
+  encoded_filter=$(jq -sRr @uri <<< "[{\"name_and_identifier\":{\"operator\":\"=\",\"values\":[\"$selector\"]}}]")
+  local response
+  response=$(api_get "/projects?filters=${encoded_filter}&pageSize=1")
+
+  local total
+  total=$(echo "$response" | jq '.total // 0')
+  if [[ "$total" == "0" ]]; then
+    echo "Error: No project found with identifier '$selector'."
+    exit 1
+  fi
+
+  local id name identifier
+  id=$(echo "$response" | jq -r '._embedded.elements[0].id')
+  name=$(echo "$response" | jq -r '._embedded.elements[0].name')
+  identifier=$(echo "$response" | jq -r '._embedded.elements[0].identifier')
+  set_selected_project "$id"
+  echo "Selected project: $name ($identifier) [id=$id]"
+}
+
+cmd_projects() {
+  local subcmd="${1:-list}"
+  shift || true
+
+  case "$subcmd" in
+    list|ls)
+      cmd_projects_list "$@"
+      ;;
+    select|sel|use)
+      cmd_projects_select "$@"
+      ;;
+    *)
+      echo "Unknown subcommand: projects $subcmd"
+      echo "Usage: op projects [list|ls|select|sel] [options]"
+      exit 1
+      ;;
+  esac
+}
+
+# Format ISO 8601 duration (PT2H30M) to human readable (2h 30m)
+format_duration() {
+  echo "$1" | sed -E \
+    -e 's/^PT//' \
+    -e 's/([0-9]+)D/\1d /g' \
+    -e 's/([0-9]+)H/\1h /g' \
+    -e 's/([0-9]+)M/\1m /g' \
+    -e 's/([0-9]+)S/\1s/g' \
+    -e 's/  +/ /g' \
+    -e 's/^ //' \
+    -e 's/ $//'
+}
+
+# Resolve a name (or partial name) to a user ID via memberships
+resolve_user_id() {
+  local project_id="$1"
+  local name_query="$2"
+
+  local filter
+  filter="[{\"project\":{\"operator\":\"=\",\"values\":[\"$project_id\"]}},{\"any_name_attribute\":{\"operator\":\"~\",\"values\":[\"$name_query\"]}}]"
+  local encoded_filter
+  encoded_filter=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$filter" 2>/dev/null || \
+                  jq -rn --arg f "$filter" '$f | @uri')
+
+  local response
+  response=$(api_get "/memberships?filters=${encoded_filter}&pageSize=5")
+
+  local total
+  total=$(echo "$response" | jq '.total // 0')
+  if [[ "$total" == "0" ]]; then
+    return 1
+  fi
+
+  # If more than 1 match, print candidates and let user pick
+  if [[ "$total" -gt 1 ]]; then
+    echo "Multiple users matched '$name_query':" >&2
+    echo "$response" | jq -r '._embedded.elements[] | "  \(._links.principal.href | split("/") | last)  \(._links.principal.title)"' >&2
+    echo "Tip: use --assignee=<user_id> to select exactly." >&2
+    return 1
+  fi
+
+  # Extract user ID from the principal href (e.g. /api/v3/users/4 -> 4)
+  echo "$response" | jq -r '._embedded.elements[0]._links.principal.href | split("/") | last'
+}
+
+# ─── Work Packages Commands ────────────────────────────────────────────────────
+
+# Resolve a type name (fuzzy) to its API href for a given project
+resolve_type_href() {
+  local project_id="$1"
+  local type_query="$2"
+
+  local response
+  response=$(api_get "/projects/${project_id}/work_packages/form" \
+    -X POST -H "Content-Type: application/json" -d '{}')
+
+  # Find matching type (case-insensitive contains)
+  local match
+  match=$(echo "$response" | jq -r \
+    --arg q "$(echo "$type_query" | tr "[:upper:]" "[:lower:]")" \
+    '._embedded.schema.type._embedded.allowedValues[]
+     | select((.name | ascii_downcase) | contains($q))
+     | "/api/v3/types/\(.id)"' | head -1)
+
+  if [[ -z "$match" ]]; then
+    echo "Error: No type found matching '${type_query}'." >&2
+    echo "Available types:" >&2
+    echo "$response" | jq -r \
+      '._embedded.schema.type._embedded.allowedValues[] | "  \(.name)"' >&2
+    return 1
+  fi
+  echo "$match"
+}
+
+cmd_workpackages_create() {
+  local project_id
+  project_id=$(require_selected_project)
+
+  local title=""
+  local description=""
+  local type_input=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title=*|-t=*)
+        title="${1#*=}"
+        shift
+        ;;
+      --title|-t)
+        title="${2:-}"
+        shift 2
+        ;;
+      --description=*|-d=*)
+        description="${1#*=}"
+        shift
+        ;;
+      --description|-d)
+        description="${2:-}"
+        shift 2
+        ;;
+      --type=*)
+        type_input="${1#--type=}"
+        shift
+        ;;
+      --type)
+        type_input="${2:-}"
+        shift 2
+        ;;
+      *)
+        echo "Unknown option: $1"
+        echo "Run 'op wp help' for usage."
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$title" ]]; then
+    echo "Error: --title (-t) is required." >&2
+    exit 1
+  fi
+
+  # Build _links — start empty, add type if given
+  local links='{}'
+
+  if [[ -n "$type_input" ]]; then
+    local type_href
+    if [[ "$type_input" =~ ^[0-9]+$ ]]; then
+      type_href="/api/v3/types/${type_input}"
+    else
+      type_href=$(resolve_type_href "$project_id" "$type_input") || exit 1
+    fi
+    links=$(echo "$links" | jq --arg href "$type_href" '. + {type: {href: $href}}')
+  fi
+
+  # Build JSON body
+  local body
+  body=$(jq -n \
+    --arg subject "$title" \
+    --arg desc "$description" \
+    --argjson links "$links" \
+    '{
+      subject: $subject,
+      description: {raw: $desc},
+      _links: $links
+    }')
+
+  local response
+  response=$(api_get "/projects/${project_id}/work_packages" \
+    -X POST -H "Content-Type: application/json" -d "$body")
+
+  # Check for API error
+  local error_type
+  error_type=$(echo "$response" | jq -r '._type // ""')
+  if [[ "$error_type" == "Error" ]]; then
+    echo "Error creating work package:" >&2
+    echo "$response" | jq -r '.message' >&2
+    echo "$response" | jq -r '.._embedded.details[]?.message // empty' 2>/dev/null >&2
+    exit 1
+  fi
+
+  local new_id new_subject type_name status_name
+  new_id=$(echo "$response" | jq -r '.id')
+  new_subject=$(echo "$response" | jq -r '.subject')
+  type_name=$(echo "$response" | jq -r '._links.type.title')
+  status_name=$(echo "$response" | jq -r '._links.status.title')
+
+  printf "  ${C_BRGREEN}Created${C_RESET}  ${C_BRRED}#%s${C_RESET}  ${C_BRBLUE}%s${C_RESET}\n" "$new_id" "$new_subject"
+  printf "  ${C_DIM}    "
+  color_type "$type_name"; printf "  ·  "
+  color_status "$status_name"
+  printf "${C_RESET}\n"
+}
+
+cmd_workpackages_list() {
+  local project_id
+  project_id=$(require_selected_project)
+
+  local filters='[]'
+  local sort_by='[["updatedAt","desc"]]'
+  local limit=20
+  local show_all=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all|-a)
+        show_all=true
+        shift
+        ;;
+      -n|--limit=*)
+        if [[ "$1" == "--limit="* ]]; then
+          limit="${1#--limit=}"
+        else
+          limit="${2:-}"
+          shift
+        fi
+        shift
+        ;;
+      --status=*)
+        local status_val="${1#--status=}"
+        filters="[{\"status\":{\"operator\":\"=\",\"values\":[\"$status_val\"]}}]"
+        shift
+        ;;
+      --assignee=*)
+        local assignee_val="${1#--assignee=}"
+        # If it's a number, use directly; otherwise resolve name to user ID
+        if [[ "$assignee_val" =~ ^[0-9]+$ ]]; then
+          filters="[{\"assignee\":{\"operator\":\"=\",\"values\":[\"$assignee_val\"]}}]"
+        else
+          local user_id
+          user_id=$(resolve_user_id "$project_id" "$assignee_val") || {
+            echo "Error: No user found matching '$assignee_val'. Use a user ID or part of their name."
+            exit 1
+          }
+          filters="[{\"assignee\":{\"operator\":\"=\",\"values\":[\"$user_id\"]}}]"
+        fi
+        shift
+        ;;
+      --sort=*)
+        sort_by="[[\"${1#--sort=}\" | sed 's/:/","/g')]]"
+        shift
+        ;;
+      *)
+        echo "Unknown option: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  # If not --all, filter to open statuses only
+  if [[ "$show_all" == "false" && "$filters" == '[]' ]]; then
+    filters='[{"status":{"operator":"o","values":null}}]'
+  fi
+
+  local encoded_filters encoded_sort
+  encoded_filters=$(jq -sRr @uri <<< "$filters")
+  encoded_sort=$(jq -sRr @uri <<< "$sort_by")
+
+  local response
+  response=$(api_get "/projects/${project_id}/work_packages?filters=${encoded_filters}&sortBy=${encoded_sort}&pageSize=${limit}")
+
+  echo "$response" | jq -r '
+    ._embedded.elements[] |
+    "\(.id)\t\(.subject)\t\(._links.type.title)\t\(._links.status.title)\t\(if ._links.assignee then ._links.assignee.title else "-" end)\t\(.updatedAt // "-")"
+  ' | while IFS=$'\t' read -r id subject wp_type status assignee updated; do
+      # Convert UTC to GMT+8 and format as YYYY-MM-DD HH:MM
+      if [[ "$updated" != "-" ]]; then
+        updated_fmt=$(date -d "$updated" +"%Y-%m-%d %H:%M" 2>/dev/null || \
+                      echo "$updated" | sed -E 's/^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2}:[0-9]{2}).*/\1 \2/')
+      else
+        updated_fmt="-"
+      fi
+      # Fetch activity count (pageSize=1 to minimize transfer)
+      local activity_count=0
+      activity_count=$(api_get "/work_packages/$id/activities?pageSize=1" 2>/dev/null | jq -r '.total // 0') || activity_count=0
+      # Activity badge
+      local act_badge=""
+      if [[ "$activity_count" != "0" ]]; then
+        act_badge=$(printf "${C_BRYELLOW}%s activity${C_RESET}" "$activity_count")
+        if [[ "$activity_count" != "1" ]]; then
+          act_badge=$(printf "${C_BRYELLOW}%s activities${C_RESET}" "$activity_count")
+        fi
+      fi
+      # Line 1: ID and full name
+      printf "  ${C_BRRED}#%s${C_RESET}  ${C_BRBLUE}%s${C_RESET}" "$id" "$subject"
+      if [[ -n "$act_badge" ]]; then printf "  %s" "$act_badge"; fi
+      printf "\n"
+      # Line 2: type · status · assignee · updated
+      printf "  ${C_DIM}    "
+      color_type "$wp_type"; printf "  ${C_DIM}\u00b7${C_RESET}  "
+      color_status "$status"; printf "  ${C_DIM}\u00b7${C_RESET}  "
+      printf "%s" "$assignee"
+      printf "  ${C_DIM}\u00b7${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$updated_fmt"
+    done
+}
+
+cmd_workpackages_show() {
+  local wp_id="${1:-}"
+  if [[ -z "$wp_id" ]]; then
+    echo "Usage: op wp show <id> [-a]"
+    exit 1
+  fi
+  shift
+
+  local show_activities=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--activities) show_activities=true; shift ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  local response
+  response=$(api_get "/work_packages/$wp_id")
+
+  local subject type status assignee description
+  subject=$(echo "$response" | jq -r '.subject')
+  type=$(echo "$response" | jq -r '._links.type.title')
+  status=$(echo "$response" | jq -r '._links.status.title')
+  assignee=$(echo "$response" | jq -r 'if ._links.assignee.title then ._links.assignee.title else "-" end')
+  description=$(echo "$response" | jq -r '.description.raw // "(no description)"')
+
+  # Header bar: #id  |  type  |  status  |  assignee
+  printf "  ${C_BRRED}#%s${C_RESET}" "$wp_id"
+  printf "  ${C_DIM}|${C_RESET}  "
+  color_type "$type"
+  printf "  ${C_DIM}|${C_RESET}  "
+  color_status "$status"
+  printf "  ${C_DIM}|${C_RESET}  %s\n" "$assignee"
+  # Title
+  printf "  ${C_BRBLUE}%s${C_RESET}\n" "$subject"
+  # Separator
+  printf "  ${C_DIM}%s${C_RESET}\n" "────────────────────────────────────────"
+  # Description (indent each line)
+  printf "%s\n" "$description" | while IFS= read -r line; do
+    printf "  %s\n" "$line"
+  done
+
+  # Activities
+  if [[ "$show_activities" == true ]]; then
+    local act_resp
+    act_resp=$(api_get "/work_packages/$wp_id/activities")
+
+    local total
+    total=$(echo "$act_resp" | jq '._embedded.elements | length')
+    printf "\n  ${C_DIM}%s${C_RESET}\n" "────────────────────────────────────────"
+    printf "  ${C_BRYELLOW}%s activit%s${C_RESET}\n" "$total" "$([ "$total" = 1 ] && echo y || echo ies)"
+
+    # Resolve all unique user IDs to names upfront (file: "uid:name" per line)
+    local user_map_file
+    user_map_file=$(mktemp)
+    local uid_list
+    uid_list=$(echo "$act_resp" | jq -r '._embedded.elements[]._links.user.href | split("/") | last' | tr -d '\r' | sort -u)
+    while IFS= read -r uid; do
+      local uname
+      uname=$(api_get "/users/$uid" 2>/dev/null | jq -r '.name // .login // "user#'"$uid"'"')
+      echo "${uid}:${uname}" >> "$user_map_file"
+    done <<< "$uid_list"
+
+    # Emit ENTRY/DETAIL records so each is a plain separate line
+    echo "$act_resp" | jq -r '
+      ._embedded.elements[] |
+        ( (._links.user.href | split("/") | last) as $uid |
+          .createdAt as $ts |
+          (.comment.raw // "") as $cmt |
+          "ENTRY\t\($uid)\t\($ts)\t\($cmt)",
+          (.details[]?.raw // empty | "DETAIL\t\(.)") )
+    ' | tr -d '\r' | while IFS=$'\t' read -r rec_type f1 f2 f3; do
+        case "$rec_type" in
+          ENTRY)
+            local cur_uname
+            cur_uname=$(grep "^${f1}:" "$user_map_file" | cut -d: -f2-)
+            [[ -z "$cur_uname" ]] && cur_uname="user#${f1}"
+            local cur_ts
+            cur_ts=$(date -d "$f2" +"%Y-%m-%d %H:%M" 2>/dev/null || echo "$f2")
+            printf "\n  ${C_DIM}%s${C_RESET}  ${C_BOLD}%s${C_RESET}\n" "$cur_ts" "$cur_uname"
+            [[ -n "$f3" ]] && printf "  %s\n" "$f3"
+            ;;
+          DETAIL)
+            printf "  ${C_DIM}\u00b7 %s${C_RESET}\n" "$f1"
+            ;;
+        esac
+    done
+    rm -f "$user_map_file"
+  fi
+}
+cmd_workpackages_comment() {
+  local wp_id="${1:-}"
+  if [[ -z "$wp_id" ]]; then
+    echo "Usage: op wp comment <id> <message>"
+    echo "       op wp comment <id> -m \"message\""
+    exit 1
+  fi
+  shift
+
+  local message=""
+  if [[ "${1:-}" == "-m" || "${1:-}" == "--message" ]]; then
+    message="${2:-}"
+    if [[ -z "$message" ]]; then
+      echo "Error: message cannot be empty." >&2
+      exit 1
+    fi
+  elif [[ $# -gt 0 ]]; then
+    # Everything remaining is the message
+    message="$*"
+  else
+    echo "Error: message cannot be empty." >&2
+    echo "Usage: op wp comment <id> <message>" >&2
+    exit 1
+  fi
+
+  local body
+  body=$(jq -n --arg msg "$message" '{comment: {raw: $msg}}')
+
+  local response http_err
+  set +e
+  response=$(api_get "/work_packages/$wp_id/activities" \
+    -X POST -H "Content-Type: application/json" -d "$body")
+  http_err=$?
+  set -e
+
+  if [[ $http_err -ne 0 ]]; then
+    printf "  ${C_BRRED}Failed${C_RESET}  #%s \u2014 work package not found or access denied.\n" "$wp_id" >&2
+    exit 1
+  fi
+
+  local err_type
+  err_type=$(echo "$response" | jq -r '._type // ""')
+  if [[ "$err_type" == "Error" ]]; then
+    local err_msg
+    err_msg=$(echo "$response" | jq -r '.message')
+    printf "  ${C_BRRED}Failed${C_RESET}  #%s \u2014 %s\n" "$wp_id" "$err_msg" >&2
+    exit 1
+  fi
+
+  local activity_id
+  activity_id=$(echo "$response" | jq -r '.id')
+  printf "  ${C_BRGREEN}Commented${C_RESET}  ${C_BRRED}#%s${C_RESET}  ${C_DIM}activity #%s${C_RESET}\n" "$wp_id" "$activity_id"
+  printf "  ${C_DIM}\u00b7 %s${C_RESET}\n" "$message"
+}
+
+cmd_workpackages_edit() {
+  local wp_id="${1:-}"
+  if [[ -z "$wp_id" ]]; then
+    echo "Usage: op wp edit <id> [--title=X] [--description=X] [--type=X] [--status=X]"
+    exit 1
+  fi
+  shift
+
+  local new_title="" new_description="" new_type="" new_status="" new_assignee=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title=*|-t=*)   new_title="${1#*=}";       shift ;;
+      --title|-t)       new_title="${2:-}";         shift 2 ;;
+      --description=*|-d=*) new_description="${1#*=}"; shift ;;
+      --description|-d) new_description="${2:-}";   shift 2 ;;
+      --type=*)         new_type="${1#--type=}";    shift ;;
+      --type)           new_type="${2:-}";           shift 2 ;;
+      --status=*)        new_status="${1#--status=}";   shift ;;
+      --status)          new_status="${2:-}";           shift 2 ;;
+      --assignee=*)      new_assignee="${1#--assignee=}"; shift ;;
+      --assignee)        new_assignee="${2:-}";           shift 2 ;;
+      *) echo "Unknown option: $1"; echo "Run 'op wp help' for usage."; exit 1 ;;
+    esac
+  done
+
+  if [[ -z "$new_title" && -z "$new_description" && -z "$new_type" && -z "$new_status" && -z "$new_assignee" ]]; then
+    echo "Error: provide at least one of --title, --description, --type, --status, --assignee." >&2
+    exit 1
+  fi
+
+  # Fetch current work package to get lockVersion
+  local current
+  current=$(api_get "/work_packages/$wp_id")
+  local lock_version
+  lock_version=$(echo "$current" | jq -r '.lockVersion')
+  local project_id
+  project_id=$(require_selected_project)
+
+  # Build patch body incrementally with jq
+  local patch
+  patch=$(jq -n --argjson lv "$lock_version" '{lockVersion: $lv}')
+
+  if [[ -n "$new_title" ]]; then
+    patch=$(echo "$patch" | jq --arg v "$new_title" '. + {subject: $v}')
+  fi
+  if [[ -n "$new_description" ]]; then
+    patch=$(echo "$patch" | jq --arg v "$new_description" '. + {description: {raw: $v}}')
+  fi
+  if [[ -n "$new_type" ]]; then
+    local type_href
+    if [[ "$new_type" =~ ^[0-9]+$ ]]; then
+      type_href="/api/v3/types/${new_type}"
+    else
+      type_href=$(resolve_type_href "$project_id" "$new_type") || exit 1
+    fi
+    patch=$(echo "$patch" | jq --arg h "$type_href" '. * {_links: {type: {href: $h}}}')
+  fi
+  if [[ -n "$new_status" ]]; then
+    local status_href
+    if [[ "$new_status" =~ ^[0-9]+$ ]]; then
+      status_href="/api/v3/statuses/${new_status}"
+    else
+      # Fetch allowed statuses and match by name
+      local statuses_resp
+      statuses_resp=$(api_get "/work_packages/$wp_id/available_transition_statuses" 2>/dev/null ||                       api_get "/statuses")
+      status_href=$(echo "$statuses_resp" | jq -r \
+        --arg q "$(echo "$new_status" | tr '[:upper:]' '[:lower:]')" \
+        '._embedded.elements[] | select((.name | ascii_downcase) | contains($q)) | ._links.self.href' \
+        2>/dev/null | head -1)
+      if [[ -z "$status_href" ]]; then
+        echo "Error: No status found matching '${new_status}'." >&2
+        exit 1
+      fi
+    fi
+    patch=$(echo "$patch" | jq --arg h "$status_href" '. * {_links: {status: {href: $h}}}')
+  fi
+  if [[ -n "$new_assignee" ]]; then
+    local assignee_href
+    if [[ "$new_assignee" =~ ^[0-9]+$ ]]; then
+      assignee_href="/api/v3/users/${new_assignee}"
+    else
+      local user_id
+      user_id=$(resolve_user_id "$project_id" "$new_assignee") || exit 1
+      assignee_href="/api/v3/users/${user_id}"
+    fi
+    patch=$(echo "$patch" | jq --arg h "$assignee_href" '. * {_links: {assignee: {href: $h}}}')
+  fi
+
+  local response http_err
+  set +e
+  response=$(api_get "/work_packages/$wp_id" \
+    -X PATCH -H "Content-Type: application/json" -d "$patch")
+  http_err=$?
+  set -e
+  if [[ $http_err -ne 0 ]]; then
+    printf "  ${C_BRRED}Failed${C_RESET}  #%s — work package not found or access denied.\n" "$wp_id" >&2
+    exit 1
+  fi
+
+  local error_type
+  error_type=$(echo "$response" | jq -r '._type // ""')
+  if [[ "$error_type" == "Error" ]]; then
+    local err_msg
+    err_msg=$(echo "$response" | jq -r '.message')
+    printf "  ${C_BRRED}Failed${C_RESET}  #%s — %s\n" "$wp_id" "$err_msg" >&2
+    echo "$response" | jq -r '._embedded.details[]?.message // empty' 2>/dev/null | while IFS= read -r detail; do
+      printf "  ${C_DIM}· %s${C_RESET}\n" "$detail" >&2
+    done
+    exit 1
+  fi
+
+  local upd_subject upd_type upd_status upd_assignee
+  upd_subject=$(echo "$response" | jq -r '.subject')
+  upd_type=$(echo "$response" | jq -r '._links.type.title')
+  upd_status=$(echo "$response" | jq -r '._links.status.title')
+  upd_assignee=$(echo "$response" | jq -r 'if ._links.assignee.title then ._links.assignee.title else "-" end')
+
+  printf "  ${C_BRGREEN}Updated${C_RESET}  ${C_BRRED}#%s${C_RESET}  ${C_BRBLUE}%s${C_RESET}\n" "$wp_id" "$upd_subject"
+  printf "  ${C_DIM}    "
+  color_type "$upd_type"; printf "  ·  "
+  color_status "$upd_status"
+  printf "  ·  %s${C_RESET}\n" "$upd_assignee"
+}
+
+
+cmd_workpackages_help() {
+  cat <<'WHELP'
+op workpackages - Manage work packages
+
+USAGE
+  op workpackages|wp <subcommand> [options]
+
+SUBCOMMANDS
+  list|ls           List work packages for the selected project
+  show|get <id>     Show full details of a work package
+  create|new        Create a new work package
+  edit|update <id>  Edit an existing work package
+  comment|note <id> Add a comment to a work package
+  help|-h|--help    Show this help message
+
+LIST OPTIONS
+  -n N, --limit=N   Number of items to show (default: 20)
+  -a, --all         Include closed/done statuses (default: open only)
+  --status=X        Filter by status value
+  --assignee=X      Filter by assignee — accepts a name (partial/full) or
+                    numeric user ID.
+                      op wp list --assignee=yanga
+                      op wp list --assignee=4
+                    If the name matches multiple users, candidates are listed
+                    and you will be asked to use a more specific name or ID.
+
+EXAMPLES
+  op wp list
+  op wp list -n 5
+  op wp list --all
+  op wp list --assignee=yanga
+  op wp list --assignee=4
+  op wp list --assignee=yanga -n 10
+  op wp list --status=open
+  op wp show 42
+  op wp create -t "Fix login bug" --type=bug
+  op wp create -t "Add dashboard" --type=feature -d "User needs a dashboard"
+  op wp create -t "Quick task"
+  op wp edit 42 --title="New title"
+  op wp edit 42 --status=developed
+  op wp edit 42 --type=bug --description="Repro steps here"
+  op wp comment 42 "Looks good, merging soon"
+  op wp comment 42 -m "Please check the latest build"
+WHELP
+}
+
+cmd_workpackages() {
+  local subcmd="${1:-list}"
+  shift || true
+
+  case "$subcmd" in
+    list|ls)
+      cmd_workpackages_list "$@"
+      ;;
+    show|get)
+      cmd_workpackages_show "$@"
+      ;;
+    create|new)
+      cmd_workpackages_create "$@"
+      ;;
+    edit|update)
+      cmd_workpackages_edit "$@"
+      ;;
+    comment|note)
+      cmd_workpackages_comment "$@"
+      ;;
+    help|-h|--help)
+      cmd_workpackages_help
+      ;;
+    *)
+      echo "Unknown subcommand: workpackages $subcmd"
+      echo "Run 'op wp help' for usage."
+      exit 1
+      ;;
+  esac
+}
+
+# ─── Members Commands ─────────────────────────────────────────────────────────
+
+cmd_members_list() {
+  local project_id
+  project_id=$(require_selected_project)
+
+  local encoded_filter
+  encoded_filter=$(jq -sRr @uri <<< "[{\"project\":{\"operator\":\"=\",\"values\":[\"$project_id\"]}}]")
+
+  local response
+  response=$(api_get "/memberships?filters=${encoded_filter}&pageSize=100")
+
+  echo "$response" | jq -r '
+    ._embedded.elements[] |
+    "\(.id)\t\(._links.principal.title)\t\(._links.principal.href)\t\([._links.roles[].title] | join(", "))"
+  ' | while IFS=$'\t' read -r id name href roles; do
+      # Determine if user or group from the href
+      local type_c
+      if [[ "$href" == *"/groups/"* ]]; then
+        type_c=$(printf "${C_BRMAGENTA}Group${C_RESET}")
+      else
+        type_c=$(printf "${C_BRBLUE}User${C_RESET}")
+      fi
+      printf "  ${C_BRRED}#%s${C_RESET}  ${C_BRBLUE}%s${C_RESET}  %s  ${C_DIM}%s${C_RESET}\n" "$id" "$name" "$type_c" "$roles"
+    done
+}
+
+cmd_members() {
+  local subcmd="${1:-list}"
+  shift || true
+
+  case "$subcmd" in
+    list|ls)
+      cmd_members_list "$@"
+      ;;
+    *)
+      echo "Unknown subcommand: members $subcmd"
+      echo "Usage: op members [list|ls]"
+      exit 1
+      ;;
+  esac
+}
+
+# ─── Help ──────────────────────────────────────────────────────────────────────
+
+show_help() {
+  cat <<EOF
+op - OpenProject CLI v${VERSION}
+
+USAGE
+  op <command> [subcommand] [options]
+
+COMMANDS
+  projects list [--active] [--sort=field:dir]
+                List all projects
+  projects select <id|identifier>
+                Select a default project (e.g. 7 or sports360)
+  workpackages [list] [-n N] [--all] [--status=X] [--assignee=X]
+                List work packages (latest activity first, top N)
+  workpackages show <id>
+                Show details of a work package (assignee, time, description)
+  members [list] List members of the selected project
+  help          Show this help message
+  version       Show version
+
+CONFIGURATION
+  Set OPENPROJECT_URL and OPENPROJECT_API_KEY in:
+    $CONFIG_FILE
+  or export them as environment variables.
+
+  The selected project is saved in:
+    $STATE_FILE
+
+EXAMPLES
+  op projects list
+  op projects select 7
+  op projects select sports360
+  op wp list
+  op wp list -n 5
+  op wp list --all
+  op wp show 42
+  op members list
+  op members
+EOF
+}
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  # Only load config for commands that need API access
+  case "$cmd" in
+    help|--help|-h)
+      show_help
+      exit 0
+      ;;
+    version|--version|-v)
+      echo "op v${VERSION}"
+      exit 0
+      ;;
+    projects)
+      load_config
+      cmd_projects "$@"
+      ;;
+    workpackages|wp)
+      load_config
+      cmd_workpackages "$@"
+      ;;
+    members|m)
+      load_config
+      cmd_members "$@"
+      ;;
+    *)
+      echo "Unknown command: $cmd"
+      show_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

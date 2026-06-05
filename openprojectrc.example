@@ -1,0 +1,5 @@
+# OpenProject CLI configuration
+# Copy this file to ~/.openprojectrc and fill in your values
+
+OPENPROJECT_URL=""
+OPENPROJECT_API_KEY=""
