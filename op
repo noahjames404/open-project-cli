@@ -278,6 +278,33 @@ resolve_user_id() {
 
 # ─── Work Packages Commands ────────────────────────────────────────────────────
 
+# Resolve a status name (fuzzy) to its numeric ID
+resolve_status_id() {
+  local status_query="$1"
+
+  if [[ "$status_query" =~ ^[0-9]+$ ]]; then
+    echo "$status_query"
+    return
+  fi
+
+  local response
+  response=$(api_get "/statuses")
+
+  local match
+  match=$(echo "$response" | jq -r \
+    --arg q "$(echo "$status_query" | tr '[:upper:]' '[:lower:]')" \
+    '._embedded.elements[] | select((.name | ascii_downcase) | contains($q)) | .id' \
+    | head -1)
+
+  if [[ -z "$match" ]]; then
+    echo "Error: No status found matching '${status_query}'." >&2
+    echo "Available statuses:" >&2
+    echo "$response" | jq -r '._embedded.elements[] | "  \(.id)  \(.name)"' >&2
+    return 1
+  fi
+  echo "$match"
+}
+
 # Resolve a type name (fuzzy) to its API href for a given project
 resolve_type_href() {
   local project_id="$1"
@@ -412,7 +439,9 @@ cmd_workpackages_list() {
   local sort_by='[["updatedAt","desc"]]'
   local limit=20
   local show_all=false
-
+  local filter_status=""
+  local filter_assignee=""
+  
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --all|-a)
@@ -430,26 +459,27 @@ cmd_workpackages_list() {
         ;;
       --status=*)
         local status_val="${1#--status=}"
-        filters="[{\"status\":{\"operator\":\"=\",\"values\":[\"$status_val\"]}}]"
+        local status_id
+        status_id=$(resolve_status_id "$status_val") || exit 1
+        filter_status="$status_id"
         shift
         ;;
       --assignee=*)
         local assignee_val="${1#--assignee=}"
-        # If it's a number, use directly; otherwise resolve name to user ID
         if [[ "$assignee_val" =~ ^[0-9]+$ ]]; then
-          filters="[{\"assignee\":{\"operator\":\"=\",\"values\":[\"$assignee_val\"]}}]"
+          filter_assignee="$assignee_val"
         else
           local user_id
           user_id=$(resolve_user_id "$project_id" "$assignee_val") || {
             echo "Error: No user found matching '$assignee_val'. Use a user ID or part of their name."
             exit 1
           }
-          filters="[{\"assignee\":{\"operator\":\"=\",\"values\":[\"$user_id\"]}}]"
+          filter_assignee="$user_id"
         fi
         shift
         ;;
       --sort=*)
-        sort_by="[[\"${1#--sort=}\" | sed 's/:/","/g')]]"
+        sort_by="[[\"${1#--sort=}\" | sed 's/:/","/g')]]" 
         shift
         ;;
       *)
@@ -458,10 +488,22 @@ cmd_workpackages_list() {
         ;;
     esac
   done
-
-  # If not --all, filter to open statuses only
-  if [[ "$show_all" == "false" && "$filters" == '[]' ]]; then
-    filters='[{"status":{"operator":"o","values":null}}]'
+  
+  # Build filters array — combine status + assignee + open-only default
+  local filter_parts=()
+  if [[ -n "$filter_status" ]]; then
+    filter_parts+=("\"status\":{\"operator\":\"=\",\"values\":[\"$filter_status\"]}")
+  elif [[ "$show_all" == "false" ]]; then
+    # No explicit status → default to open statuses only
+    filter_parts+=("\"status\":{\"operator\":\"o\",\"values\":null}")
+  fi
+  if [[ -n "$filter_assignee" ]]; then
+    filter_parts+=("\"assignee\":{\"operator\":\"=\",\"values\":[\"$filter_assignee\"]}")
+  fi
+  if [[ ${#filter_parts[@]} -gt 0 ]]; then
+    local joined
+    joined=$(printf '{%s},' "${filter_parts[@]}")
+    filters="[${joined%,}]"
   fi
 
   local encoded_filters encoded_sort
